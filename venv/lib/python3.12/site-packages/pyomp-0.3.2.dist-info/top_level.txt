@@ -1,0 +1,3 @@
+libomp
+numba
+pass
