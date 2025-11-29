@@ -1,196 +1,185 @@
 import numpy as np
 import time
 from numba import njit, prange
+import csv
+
+openmp_results = "openmp_results.csv"
+
+with open(openmp_results, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["dtype", "size", "op", "parallel", "seq", "abs_err", "time", "GBs"])
 
 def now():
     return time.perf_counter()
 
-@njit
-def next_pow2(n):
-    """Smallest power of two >= n (Numba-compatible)."""
-    m = 1
-    while m < n:
-        m *= 2
-    return m
-
 @njit(parallel=True)
-def parallel_sum(a):
+def psum(a):
     n = len(a)
-    tmp = np.zeros(n, dtype=a.dtype)
-    for i in prange(n):
-        tmp[i] = a[i]
-    total = tmp.sum()
+    nb = min(64, n)
+    bs = (n + nb - 1) // nb
+    block = np.zeros(nb, a.dtype)
+    for b in prange(nb):
+        s = b * bs
+        e = min(s + bs, n)
+        tmp = 0
+        for i in range(s, e):
+            tmp += a[i]
+        block[b] = tmp
+    total = 0
+    for i in range(nb):
+        total += block[i]
     return total
 
 @njit(parallel=True)
-def parallel_min(a):
+def pmin(a):
     n = len(a)
-    nb = 64
-    block_size = (n + nb - 1) // nb
-    block_mins = np.full(nb, np.inf, dtype=a.dtype)
+    nb = min(64, n)
+    bs = (n+nb-1)// nb
+    block = np.empty(nb, a.dtype)
     for b in prange(nb):
-        start = b * block_size
-        end = min(start + block_size, n)
-        if end > start:
-            local_min = a[start]
-            for i in range(start+1, end):
-                if a[i] < local_min:
-                    local_min = a[i]
-            block_mins[b] = local_min
-    return np.min(block_mins)
+        s = b*bs
+        e = min(s+bs,n)
+        m = a[s]
+        for i in range(s+1,e):
+            if a[i] < m:
+                m = a[i]
+        block[b] = m
+    out = block[0]
+    for i in range(1, nb):
+        if block[i] < out:
+            out = block[i]
+    return out
 
 @njit(parallel=True)
-def parallel_max(a):
+def pmax(a):
     n = len(a)
-    nb = 64
-    block_size = (n + nb - 1) // nb
-    block_maxs = np.full(nb, -np.inf, dtype=a.dtype)
+    nb = min(64, n)
+    bs = (n+nb-1) // nb
+    block = np.empty(nb, a.dtype)
     for b in prange(nb):
-        start = b * block_size
-        end = min(start + block_size, n)
-        if end > start:
-            local_max = a[start]
-            for i in range(start+1, end):
-                if a[i] > local_max:
-                    local_max = a[i]
-            block_maxs[b] = local_max
-    return np.max(block_maxs)
+        s = b*bs
+        e = min(s+bs, n)
+        m = a[s]
+        for i in range(s+1, e):
+            if a[i] > m:
+                m = a[i]
+        block[b] = m
+    out = block[0]
+    for i in range(1, nb):
+        if block[i] > out:
+            out = block[i]
+    return out
 
 @njit
-def blelloch_scan(buf):
-    n = len(buf)
-    m = next_pow2(n)
-    temp = np.zeros(m, dtype=buf.dtype)
-    temp[:n] = buf.copy()
+def blelloch(x):
+    n = len(x)
+    m = 1
+    while m < n:
+        m <<= 1
+    t = np.zeros(m, x.dtype)
+    t[:n] = x
     d = 1
     while d < m:
         for i in range(0, m, 2*d):
-            temp[i + 2*d - 1] += temp[i + d - 1]
-        d *= 2
-
-    temp[m-1] = 0
-    d = m // 2
-    while d >= 1:
+            t[i+2*d-1]+= t[i+d-1]
+        d <<= 1
+    t[m-1] = 0
+    d = m >> 1
+    while d:
         for i in range(0, m, 2*d):
-            t = temp[i + d - 1]
-            temp[i + d - 1] = temp[i + 2*d - 1]
-            temp[i + 2*d - 1] += t
-        d //= 2
-
-    buf[:] = temp[:n]
+            v = t[i+d-1]
+            t[i+d-1] = t[i+2*d-1]
+            t[i + 2 * d - 1] += v
+        d >>= 1
+    x[:] = t[:n]
 
 @njit(parallel=True)
-def block_blelloch_scan(a, block_size=1 << 16):
+def scan(a, bs):
     n = len(a)
-    nb = (n + block_size - 1) // block_size
-    block_totals = np.zeros(nb, dtype=a.dtype)
+    orig = a.copy()
+    nb = (n+bs-1) // bs
+    totals = np.zeros(nb, a.dtype)
     for b in prange(nb):
-        start = b * block_size
-        end = min(start + block_size, n)
-        if end > start:
-            buf = a[start:end].copy()
-            blelloch_scan(buf)
-            a[start:end] = buf
-            block_totals[b] = buf[-1] + a[start]
-
-    offsets = np.zeros_like(block_totals)
+        s = b * bs
+        e = min(s + bs, n)
+        if s < e:
+            buf = orig[s:e].copy()
+            blelloch(buf)
+            a[s:e] = buf
+            totals[b] = buf[-1] + orig[e - 1]
+    offs = np.zeros(nb, a.dtype)
     acc = 0
-    for b in range(nb):
-        offsets[b] = acc
-        acc += block_totals[b]
-
+    for i in range(nb):
+        offs[i] = acc
+        acc += totals[i]
     for b in prange(nb):
-        off = offsets[b]
-        start = b * block_size
-        end = min(start + block_size, n)
-        if off != 0:
-            for i in range(start, end):
-                a[i] += off
+        s = b * bs
+        e = min(s + bs, n)
+        o = offs[b]
+        for i in range(s, e):
+            a[i] += o
+    for i in prange(n):
+        a[i] += orig[i]
 
-    return a
-
-def check_and_bench(dtype: np.dtype, count: int, block_size: int = 1 << 16, samples: int = 5):
-    rng = np.random.default_rng(12345)
+def bench(dtype, n, block_size):
+    rng = np.random.default_rng(0)
     if np.issubdtype(dtype, np.floating):
-        base = rng.uniform(-100.0, 100.0, size=count).astype(dtype)
+        a = rng.uniform(-100, 100, n).astype(dtype)
     else:
-        base = rng.integers(-1000, 1000, size=count, dtype=dtype)
-    elem_bytes = base.dtype.itemsize
+        a = rng.integers(-1000, 1000, n, dtype=dtype)
+    size = a.dtype.itemsize
 
-    print(f"\n=== dtype={dtype} count={count:,} block_size={block_size} ===")
+    with open(openmp_results, "a", newline="") as f:
+        w = csv.writer(f)
 
-    seq_sum = base.sum()
-    times = []
-    for _ in range(samples):
-        arr = base.copy()
+        #SUM
+        print(f"{'Op'} {'Parallel'} {'Seq'} {'AbsErr'} {'Time[s]'} {'GB/s'}")
         t0 = now()
-        psum = parallel_sum(arr)
+        r = psum(a)
         dt = now() - t0
-        times.append(dt)
-    t = sum(times)/len(times)
-    abs_err = float(psum - seq_sum)
-    rel_err = abs_err / (abs(seq_sum)+1e-30)
-    gb_per_s = (count * elem_bytes)/(t*1e9)
-    print(f"SUM: parallel={psum} seq={seq_sum} abs_err={abs_err} rel_err={rel_err:.3e} time={t:.6f}s GB/s≈{gb_per_s:.3f}")
+        err = abs(r - a.sum())
+        gbs = (n*size)/(dt*1e9)
+        print(f"{'SUM'} {r} {a.sum()} {err} {dt} {gbs}")
+        w.writerow([str(dtype), n, "SUM", r, a.sum(), err, dt, gbs])
 
-    seq_min = base.min()
-    times = []
-    for _ in range(samples):
-        arr = base.copy()
+        # MIN
         t0 = now()
-        pmin = parallel_min(arr)
+        r = pmin(a)
         dt = now() - t0
-        times.append(dt)
-    t = sum(times)/len(times)
-    gb_per_s = (count * elem_bytes)/(t*1e9)
-    print(f"MIN: parallel={pmin} seq={seq_min} diff={pmin - seq_min} time={t:.6f}s GB/s≈{gb_per_s:.3f}")
+        err = abs(r - a.min())
+        gbs = (n*size)/(dt*1e9)
+        print(f"{'MIN'} {r} {a.sum()} {err} {dt} {gbs}")
+        w.writerow([str(dtype), n, "MIN", r, a.min(), err, dt, gbs])
 
-    seq_max = base.max()
-    times = []
-    for _ in range(samples):
-        arr = base.copy()
+        # MAX
         t0 = now()
-        pmax = parallel_max(arr)
+        r = pmax(a)
         dt = now() - t0
-        times.append(dt)
-    t = sum(times)/len(times)
-    gb_per_s = (count * elem_bytes)/(t*1e9)
-    print(f"MAX: parallel={pmax} seq={seq_max} diff={pmax - seq_max} time={t:.6f}s GB/s≈{gb_per_s:.3f}")
+        err = abs(r - a.max())
+        gbs = (n*size)/(dt*1e9)
+        print(f"{'MAX'} {r} {a.sum()} {err} {dt} {gbs}")
+        w.writerow([str(dtype), n, "MAX", r, a.max(), err, dt, gbs])
 
-    times = []
-    seq = np.cumsum(base)
-    for _ in range(samples):
-        arr = base.copy()
+        # SCAN
+        seq = np.cumsum(a)
+        b = a.copy()
         t0 = now()
-        block_blelloch_scan(arr, block_size=block_size)
+        scan(b, block_size)
         dt = now() - t0
-        times.append(dt)
-        if np.issubdtype(dtype, np.floating):
-            abs_err = float(np.max(np.abs(arr - seq)))
-            rel_err = float(np.max(np.abs((arr - seq)/(np.abs(seq)+1e-30))))
-        else:
-            max_err = int(np.max(np.abs(arr - seq)))
-    t = sum(times)/len(times)
-    gb_per_s = (2 * count * elem_bytes)/(t*1e9)
-    if np.issubdtype(dtype, np.floating):
-        print(f"SCAN: max_abs_err={abs_err:.3e} max_rel_err={rel_err:.3e} time={t:.6f}s GB/s≈{gb_per_s:.3f}")
-    else:
-        print(f"SCAN: max_err={max_err} time={t:.6f}s GB/s≈{gb_per_s:.3f}")
+        err = np.max(np.abs(b - seq))
+        gbs = (2*n*size)/(dt*1e9)
+        print(f"{'SCAN'} {r} {a.sum()} {err} {dt} {gbs}")
+        w.writerow([str(dtype), n, "SCAN", 0, 0, err, dt, gbs])
+
 
 def main():
-    tested_types = [np.int64, np.float64]
-    tested_counts = [1 << 10, 1 << 20, 1 << 24]
+    types = [np.int64, np.int32, np.float64, np.float32]
+    sizes = [1 << 10, 1 << 20, 1 << 24]
     block_size = 1 << 16
-    samples = 3
-
-    print("NumPy version:", np.__version__)
-    import sys
-    print("Python:", sys.version.splitlines()[0])
-
-    for dtype in tested_types:
-        for count in tested_counts:
-            check_and_bench(dtype, count, block_size=block_size, samples=samples)
-            print("-"*70)
+    for t in types:
+        for n in sizes:
+            print(f"Type: {t}, Size: {n}")
+            bench(t, n, block_size)
 
 if __name__ == "__main__":
     main()
